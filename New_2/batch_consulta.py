@@ -16,7 +16,7 @@ from typing import Dict, Tuple, Any, Optional, List
 # Config da Aplicação
 # =========================
 st.set_page_config(
-    page_title="Consulta CNPJ em Lote - Adapta (Turbo)",
+    page_title="Consulta de CNPJ em Lote - Adapta (Turbo)",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -66,7 +66,7 @@ REQ_TIMEOUT   = 20
 # Limite de inputs
 MAX_INPUTS = 1000
 
-# ---------- Cache global thread-safe (não usa session_state nas threads) ----------
+# ---------- Cache global thread-safe ----------
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
 
@@ -140,6 +140,17 @@ def extrair_cnaes(api_data: Dict[str, Any]) -> Tuple[str, str]:
         elif c:
             cnae_sec = str(c)
     return cnae_principal, cnae_sec
+
+def humanize_seconds(seconds: float) -> str:
+    """Converte segundos em 'Hh Mm Ss' sem termos técnicos."""
+    s = int(max(0, round(seconds)))
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if h: parts.append(f"{h}h")
+    if m or h: parts.append(f"{m}m")
+    parts.append(f"{s}s")
+    return " ".join(parts)
 
 # =========================
 # Rate Limiter Adaptativo (lock próprio)
@@ -301,9 +312,10 @@ if st.button("🔱 Consultar em Lote"):
         st.stop()
 
     total = len(uniq_inputs)
-    st.info(f"Processando **{total}** CNPJs com **{MAX_WORKERS}** threads. O ritmo é controlado automaticamente para evitar bloqueios pela API.")
+    st.info(f"Processando **{total}** CNPJs com **{MAX_WORKERS}** consultas em paralelo. "
+            f"O ritmo se ajusta automaticamente para evitar bloqueios da API.")
     progress = st.progress(0)
-    eta_box = st.empty()
+    status_box = st.empty()
 
     limiter_global = AdaptiveLimiter(min_interval=START_INTERVAL)
 
@@ -319,14 +331,18 @@ if st.button("🔱 Consultar em Lote"):
             done_count += 1
             progress.progress(done_count / total)
 
+            # ---- Status amigável para leigos ----
             elapsed = time.time() - started_at
-            remaining = total - done_count
-            eff_rate = done_count / elapsed if elapsed > 0 else 0.0001
+            remaining = max(0, total - done_count)
+            eff_rate = done_count / elapsed if elapsed > 0 else 0.0
             eta_sec = remaining / eff_rate if eff_rate > 0 else 0
             finish_time = datetime.datetime.now(BRASILIA_TZ) + datetime.timedelta(seconds=int(eta_sec))
-            eta_box.info(
-                f"Progresso: **{done_count}/{total}**  •  Taxa efetiva: **{eff_rate:.2f} req/s**  •  "
-                f"ETA: **{str(datetime.timedelta(seconds=int(eta_sec)))}** (≈ {finish_time.strftime('%H:%M:%S')})"
+
+            status_box.info(
+                f"📊 **Andamento:** {done_count} de {total} CNPJs processados  \n"
+                f"⚡ **Velocidade:** ~{eff_rate:.2f} CNPJs por segundo  \n"
+                f"⏳ **Tempo restante:** {humanize_seconds(eta_sec)}  \n"
+                f"🕒 **Previsão de término:** {finish_time.strftime('%H:%M:%S')}"
             )
 
     # Ordena pela ordem de entrada original
