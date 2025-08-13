@@ -5,8 +5,8 @@ import pandas as pd
 import time
 import datetime
 import io
-import math
 import random
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
@@ -66,6 +66,18 @@ REQ_TIMEOUT   = 20
 # Limite de inputs
 MAX_INPUTS = 1000
 
+# ---------- Cache global thread-safe (não usa session_state nas threads) ----------
+_CACHE: Dict[str, Dict[str, Any]] = {}
+_CACHE_LOCK = threading.Lock()
+
+def cache_get(cnpj: str) -> Optional[Dict[str, Any]]:
+    with _CACHE_LOCK:
+        return _CACHE.get(cnpj)
+
+def cache_set(cnpj: str, data: Dict[str, Any]) -> None:
+    with _CACHE_LOCK:
+        _CACHE[cnpj] = data
+
 # =========================
 # Helpers
 # =========================
@@ -101,7 +113,8 @@ def get_regime_tributario(regimes_list: Any) -> Tuple[str, str]:
     for y in [current_year - i for i in range(6)]:
         if y in regimes_por_ano and regimes_por_ano[y]:
             return regimes_por_ano[y], str(y)
-    latest = max((r for r in regimes_list if isinstance(r, dict) and r.get('ano') is not None), key=lambda x: x['ano'], default=None)
+    latest = max((r for r in regimes_list if isinstance(r, dict) and r.get('ano') is not None),
+                 key=lambda x: x['ano'], default=None)
     if latest:
         return latest.get('forma_de_tributacao', "N/A"), str(latest.get('ano', "N/A"))
     return "N/A", "N/A"
@@ -129,30 +142,31 @@ def extrair_cnaes(api_data: Dict[str, Any]) -> Tuple[str, str]:
     return cnae_principal, cnae_sec
 
 # =========================
-# Rate Limiter Adaptativo
+# Rate Limiter Adaptativo (lock próprio)
 # =========================
 @dataclass
 class AdaptiveLimiter:
     min_interval: float = START_INTERVAL
     last_request_ts: float = 0.0
     successes_since_last_adjust: int = 0
+
     def __post_init__(self):
-        self._lock = st.session_state.get("_limiter_lock")
-        if self._lock is None:
-            import threading
-            self._lock = threading.Lock()
-            st.session_state["_limiter_lock"] = self._lock
+        self._lock = threading.Lock()
+
     def wait_turn(self):
+        # espaçamento mínimo global (entre todas as threads que compartilham este objeto)
         with self._lock:
             now = time.time()
             wait_for = (self.last_request_ts + self.min_interval) - now
             if wait_for > 0:
                 time.sleep(wait_for)
             self.last_request_ts = time.time()
+
     def penalize(self):
         with self._lock:
             self.min_interval = min(self.min_interval * ADAPT_FAIL_BACKOFF, MIN_INTERVAL_CEIL)
             self.successes_since_last_adjust = 0
+
     def reward(self):
         with self._lock:
             self.successes_since_last_adjust += 1
@@ -161,30 +175,18 @@ class AdaptiveLimiter:
                 self.successes_since_last_adjust = 0
 
 # =========================
-# Cache (sessão)
-# =========================
-if "cache_cnpj" not in st.session_state:
-    st.session_state.cache_cnpj: Dict[str, Dict[str, Any]] = {}
-
-def cache_get(cnpj: str) -> Optional[Dict[str, Any]]:
-    return st.session_state.cache_cnpj.get(cnpj)
-
-def cache_set(cnpj: str, data: Dict[str, Any]):
-    st.session_state.cache_cnpj[cnpj] = data
-
-# =========================
 # Requisição com retry/backoff
 # =========================
-def request_cnpj_with_retry(cnpj_query: str, limiter: AdaptiveLimiter) -> Tuple[Optional[Dict[str, Any]], Dict[str, int], Optional[str]]:
-    metrics = {"retries": 0, "penalties": 0}
+def request_cnpj_with_retry(cnpj_query: str, limiter: AdaptiveLimiter) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Retorna (api_data, error_msg)
+    """
     last_err = None
     for attempt in range(1, TOTAL_RETRIES + 1):
         limiter.wait_turn()
         try:
             resp = requests.get(f"{URL_BRASILAPI_CNPJ}{cnpj_query}", timeout=REQ_TIMEOUT)
             if resp.status_code in (429, 503):
-                metrics["retries"] += 1
-                metrics["penalties"] += 1
                 limiter.penalize()
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after:
@@ -198,34 +200,33 @@ def request_cnpj_with_retry(cnpj_query: str, limiter: AdaptiveLimiter) -> Tuple[
                 time.sleep(sleep_s)
                 last_err = f"HTTP {resp.status_code}"
                 continue
+
             resp.raise_for_status()
             data = resp.json()
             limiter.reward()
-            return data, metrics, None
+            return data, None
+
         except requests.exceptions.Timeout:
-            metrics["retries"] += 1
-            metrics["penalties"] += 1
             limiter.penalize()
             base = max(limiter.min_interval, 1.2)
             time.sleep(min(base * (2 ** (attempt - 1)) + random.uniform(0, 0.5), MIN_INTERVAL_CEIL))
             last_err = "Timeout"
         except requests.exceptions.ConnectionError:
-            metrics["retries"] += 1
-            metrics["penalties"] += 1
             limiter.penalize()
             base = max(limiter.min_interval, 1.2)
             time.sleep(min(base * (2 ** (attempt - 1)) + random.uniform(0, 0.5), MIN_INTERVAL_CEIL))
             last_err = "ConnectionError"
         except requests.exceptions.HTTPError as e:
             last_err = f"HTTP {e.response.status_code if e.response is not None else 'Error'}"
-            return None, metrics, last_err
+            return None, last_err
         except Exception as e:
             last_err = f"Erro Inesperado: {e}"
-            return None, metrics, last_err
-    return None, metrics, last_err
+            return None, last_err
+
+    return None, last_err or "Falha desconhecida"
 
 # =========================
-# Pipeline de 1 CNPJ
+# Pipeline de 1 CNPJ (executa nas threads)
 # =========================
 def process_one_cnpj(original_cnpj_str: str, limiter: AdaptiveLimiter) -> Dict[str, Any]:
     cleaned = limpar_cnpj(original_cnpj_str)
@@ -237,6 +238,8 @@ def process_one_cnpj(original_cnpj_str: str, limiter: AdaptiveLimiter) -> Dict[s
             "Regime Tributario": 'N/A', "Ano Regime Tributario": 'N/A',
             "CNAE Principal": 'N/A', "CNAE Secundario (primeiro)": 'N/A'
         }
+
+    # cache por CNPJ limpo (da entrada)
     cached = cache_get(cleaned)
     if cached is not None:
         out = dict(cached)
@@ -244,7 +247,7 @@ def process_one_cnpj(original_cnpj_str: str, limiter: AdaptiveLimiter) -> Dict[s
         return out
 
     cnpj_to_query = to_matriz_if_filial(cleaned)
-    api_data, metrics, err_msg = request_cnpj_with_retry(cnpj_to_query, AdaptiveLimiter(min_interval=limiter.min_interval))
+    api_data, err_msg = request_cnpj_with_retry(cnpj_to_query, limiter)
 
     if api_data and "cnpj" in api_data:
         forma, ano = get_regime_tributario(api_data.get("regime_tributario", []))
@@ -298,7 +301,7 @@ if st.button("🔱 Consultar em Lote"):
         st.stop()
 
     total = len(uniq_inputs)
-    st.info(f"Processando **{total}** CNPJs com **{MAX_WORKERS}** threads. O ritmo é controlado automaticamente para evitar bloqueio pela API.")
+    st.info(f"Processando **{total}** CNPJs com **{MAX_WORKERS}** threads. O ritmo é controlado automaticamente para evitar bloqueios pela API.")
     progress = st.progress(0)
     eta_box = st.empty()
 
