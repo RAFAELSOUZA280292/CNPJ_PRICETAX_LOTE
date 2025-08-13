@@ -7,16 +7,18 @@ import datetime
 import io
 import random
 import threading
+import hashlib
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
-from typing import Dict, Tuple, Any, Optional, List
+from typing import Dict, Tuple, Any, Optional, List, Set
 
 # =========================
 # Config da Aplicação
 # =========================
 st.set_page_config(
-    page_title="Consulta de CNPJ em Lote - Adapta (Turbo)",
+    page_title="Consulta de CNPJ em Lote - Adapta (Turbo + Autosave)",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -40,6 +42,7 @@ st.markdown("""
     }
     .stButton > button:hover { background-color: #FFD700; color: #000000; }
     hr { border-top: 1px solid #444444; }
+    code { color: #FFD700; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -65,6 +68,17 @@ REQ_TIMEOUT   = 20
 
 # Limite de inputs
 MAX_INPUTS = 1000
+
+# Autosave
+AUTOSAVE_BLOCK = 10  # grava no CSV a cada N resultados
+OUTPUT_DIR = "autosave_cnpj"  # pasta local para arquivos parciais
+
+# Colunas fixas do CSV
+CSV_COLS = [
+    "CNPJ","Razao Social","Nome Fantasia","UF",
+    "Simples Nacional","MEI","Regime Tributario","Ano Regime Tributario",
+    "CNAE Principal","CNAE Secundario (primeiro)"
+]
 
 # ---------- Cache global thread-safe ----------
 _CACHE: Dict[str, Dict[str, Any]] = {}
@@ -142,7 +156,6 @@ def extrair_cnaes(api_data: Dict[str, Any]) -> Tuple[str, str]:
     return cnae_principal, cnae_sec
 
 def humanize_seconds(seconds: float) -> str:
-    """Converte segundos em 'Hh Mm Ss' sem termos técnicos."""
     s = int(max(0, round(seconds)))
     h, rem = divmod(s, 3600)
     m, s = divmod(rem, 60)
@@ -151,6 +164,40 @@ def humanize_seconds(seconds: float) -> str:
     if m or h: parts.append(f"{m}m")
     parts.append(f"{s}s")
     return " ".join(parts)
+
+def mk_job_id(cnpjs: List[str]) -> str:
+    base = "\n".join([limpar_cnpj(x) for x in cnpjs])
+    return hashlib.md5(base.encode("utf-8")).hexdigest()  # estável p/ a mesma lista
+
+def mk_paths(job_id: str) -> Tuple[str, str]:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    csv_path = os.path.join(OUTPUT_DIR, f"autosave_{job_id}.csv")
+    xlsx_path = os.path.join(OUTPUT_DIR, f"resultado_{job_id}.xlsx")
+    return csv_path, xlsx_path
+
+def load_done_set(csv_path: str) -> Set[str]:
+    done: Set[str] = set()
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path, sep=";", dtype=str, encoding="utf-8")
+            if "CNPJ" in df.columns:
+                for c in df["CNPJ"].tolist():
+                    if isinstance(c, str) and c.strip():
+                        done.add(c.strip())
+        except Exception:
+            pass
+    return done
+
+def append_rows_csv(csv_path: str, rows: List[Dict[str, Any]]):
+    file_exists = os.path.exists(csv_path)
+    df = pd.DataFrame(rows, columns=CSV_COLS)
+    df.fillna("", inplace=True)
+    with open(csv_path, "a", encoding="utf-8", newline="") as f:
+        if not file_exists:
+            f.write(";".join(CSV_COLS) + "\n")
+        for _, row in df.iterrows():
+            vals = [str(row[col]).replace("\n", " ").replace("\r", " ") if col in row else "" for col in CSV_COLS]
+            f.write(";".join(vals) + "\n")
 
 # =========================
 # Rate Limiter Adaptativo (lock próprio)
@@ -165,7 +212,6 @@ class AdaptiveLimiter:
         self._lock = threading.Lock()
 
     def wait_turn(self):
-        # espaçamento mínimo global (entre todas as threads que compartilham este objeto)
         with self._lock:
             now = time.time()
             wait_for = (self.last_request_ts + self.min_interval) - now
@@ -189,9 +235,6 @@ class AdaptiveLimiter:
 # Requisição com retry/backoff
 # =========================
 def request_cnpj_with_retry(cnpj_query: str, limiter: AdaptiveLimiter) -> Tuple[Optional[Dict[str, Any]], str]:
-    """
-    Retorna (api_data, error_msg)
-    """
     last_err = None
     for attempt in range(1, TOTAL_RETRIES + 1):
         limiter.wait_turn()
@@ -250,7 +293,6 @@ def process_one_cnpj(original_cnpj_str: str, limiter: AdaptiveLimiter) -> Dict[s
             "CNAE Principal": 'N/A', "CNAE Secundario (primeiro)": 'N/A'
         }
 
-    # cache por CNPJ limpo (da entrada)
     cached = cache_get(cleaned)
     if cached is not None:
         out = dict(cached)
@@ -291,7 +333,7 @@ def process_one_cnpj(original_cnpj_str: str, limiter: AdaptiveLimiter) -> Dict[s
 # =========================
 # UI
 # =========================
-st.markdown("<h1 style='text-align: center;'>Consulta de CNPJ em Lote (Turbo)</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align: center;'>Consulta de CNPJ em Lote (Turbo + Autosave)</h1>", unsafe_allow_html=True)
 st.markdown("<h3 style='text-align: center;'>Cole até 1.000 CNPJs (um por linha, vírgula, ponto e vírgula, ou espaço)</h3>", unsafe_allow_html=True)
 
 cnpjs_input = st.text_area(
@@ -305,70 +347,103 @@ if st.button("🔱 Consultar em Lote"):
         st.warning("Por favor, insira os CNPJs para consultar.")
         st.stop()
 
-    raw = re.split(r'[\n,;\s]+', cnpjs_input.strip())
-    uniq_inputs = list(dict.fromkeys(raw))  # preserva ordem e remove duplicados exatos
+    # Normaliza e deduplica mantendo ordem
+    raw = [x for x in re.split(r'[\n,;\s]+', cnpjs_input.strip()) if x]
+    uniq_inputs = list(dict.fromkeys(raw))
     if len(uniq_inputs) > MAX_INPUTS:
         st.error(f"Você enviou {len(uniq_inputs)} entradas. O limite deste app é {MAX_INPUTS}.")
         st.stop()
 
-    total = len(uniq_inputs)
-    st.info(f"Processando **{total}** CNPJs com **{MAX_WORKERS}** consultas em paralelo. "
-            f"O ritmo se ajusta automaticamente para evitar bloqueios da API.")
-    progress = st.progress(0)
-    status_box = st.empty()
+    # Gera Job ID (mesma lista => mesmo arquivo)
+    job_id = mk_job_id(uniq_inputs)
+    csv_autosave, xlsx_final = mk_paths(job_id)
 
-    limiter_global = AdaptiveLimiter(min_interval=START_INTERVAL)
+    # Lê o que já foi feito (retomada automática)
+    done_set = load_done_set(csv_autosave)
+    to_do = [c for c in uniq_inputs if c not in done_set]
 
-    results: List[Dict[str, Any]] = []
-    started_at = time.time()
+    st.info(
+        f"**Autosave** ativo em: `{csv_autosave}`  \n"
+        f"Já concluídos: **{len(done_set)}**  •  Restantes: **{len(to_do)}**"
+    )
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        fut_map = {ex.submit(process_one_cnpj, cnpj, limiter_global): cnpj for cnpj in uniq_inputs}
-        done_count = 0
-        for fut in as_completed(fut_map):
-            row = fut.result()
-            results.append(row)
-            done_count += 1
-            progress.progress(done_count / total)
+    if not to_do:
+        st.success("Todos os CNPJs desta lista já estão prontos no arquivo autosave. Você pode baixar abaixo.")
+    else:
+        st.write("---")
+        st.write(f"Iniciando processamento de **{len(to_do)}** CNPJs pendentes…")
+        progress = st.progress(0)
+        status_box = st.empty()
+        limiter_global = AdaptiveLimiter(min_interval=START_INTERVAL)
 
-            # ---- Status amigável para leigos ----
-            elapsed = time.time() - started_at
-            remaining = max(0, total - done_count)
-            eff_rate = done_count / elapsed if elapsed > 0 else 0.0
-            eta_sec = remaining / eff_rate if eff_rate > 0 else 0
-            finish_time = datetime.datetime.now(BRASILIA_TZ) + datetime.timedelta(seconds=int(eta_sec))
+        started_at = time.time()
+        buffer_rows: List[Dict[str, Any]] = []
+        done_count_incremental = 0  # progresso desta rodada (sem contar os já feitos)
+        total_this_run = len(to_do)
 
-            status_box.info(
-                f"📊 **Andamento:** {done_count} de {total} CNPJs processados  \n"
-                f"⚡ **Velocidade:** ~{eff_rate:.2f} CNPJs por segundo  \n"
-                f"⏳ **Tempo restante:** {humanize_seconds(eta_sec)}  \n"
-                f"🕒 **Previsão de término:** {finish_time.strftime('%H:%M:%S')}"
+        # Executor paralelo
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            fut_map = {ex.submit(process_one_cnpj, cnpj, limiter_global): cnpj for cnpj in to_do}
+            for i, fut in enumerate(as_completed(fut_map), start=1):
+                row = fut.result()
+                buffer_rows.append(row)
+                done_count_incremental += 1
+
+                # Autosave em blocos
+                if len(buffer_rows) >= AUTOSAVE_BLOCK:
+                    append_rows_csv(csv_autosave, buffer_rows)
+                    for r in buffer_rows:
+                        done_set.add(r.get("CNPJ", "").strip())
+                    buffer_rows.clear()
+
+                # Status amigável
+                elapsed = time.time() - started_at
+                processed_now = done_count_incremental
+                remaining_now = total_this_run - processed_now
+                eff_rate = processed_now / elapsed if elapsed > 0 else 0.0
+                eta_sec = remaining_now / eff_rate if eff_rate > 0 else 0
+                finish_time = datetime.datetime.now(BRASILIA_TZ) + datetime.timedelta(seconds=int(eta_sec))
+
+                # Progresso desta execução (não conta os já feitos de antes)
+                progress.progress(processed_now / total_this_run)
+                status_box.info(
+                    f"📊 **Andamento:** {processed_now} de {total_this_run} CNPJs (desta execução)  \n"
+                    f"⚡ **Velocidade:** ~{eff_rate:.2f} CNPJs por segundo  \n"
+                    f"⏳ **Tempo restante:** {humanize_seconds(eta_sec)}  \n"
+                    f"🕒 **Previsão de término:** {finish_time.strftime('%H:%M:%S')}"
+                )
+
+        # Grava o que restou no buffer
+        if buffer_rows:
+            append_rows_csv(csv_autosave, buffer_rows)
+            for r in buffer_rows:
+                done_set.add(r.get("CNPJ", "").strip())
+            buffer_rows.clear()
+
+        st.success(f"Concluído! Total geral no autosave: **{len(done_set)}** CNPJs.")
+
+    # Carrega tudo do autosave para exibir/baixar consolidado
+    if os.path.exists(csv_autosave):
+        try:
+            df_full = pd.read_csv(csv_autosave, sep=";", dtype=str, encoding="utf-8")
+        except Exception:
+            df_full = pd.DataFrame(columns=CSV_COLS)
+
+        st.markdown("---")
+        st.subheader("Resultados (consolidados do autosave)")
+        st.dataframe(df_full, use_container_width=True)
+
+        # Botão para baixar Excel já consolidado
+        if not df_full.empty:
+            timestamp = datetime.datetime.now(BRASILIA_TZ).strftime("%Y%m%d_%H%M%S")
+            excel_filename = f"CNPJ_Price_Tax_{timestamp}.xlsx"
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                df_full.to_excel(writer, index=False, sheet_name='Resultados CNPJ')
+            st.download_button(
+                label="📥 Baixar Excel (consolidado)",
+                data=output.getvalue(),
+                file_name=excel_filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                help="Clique para baixar os resultados em .xlsx"
             )
-
-    # Ordena pela ordem de entrada original
-    order_index = {cnpj: i for i, cnpj in enumerate(uniq_inputs)}
-    results.sort(key=lambda r: order_index.get(r.get("CNPJ", ""), 10**9))
-
-    df = pd.DataFrame(results, columns=[
-        "CNPJ","Razao Social","Nome Fantasia","UF",
-        "Simples Nacional","MEI","Regime Tributario","Ano Regime Tributario",
-        "CNAE Principal","CNAE Secundario (primeiro)"
-    ])
-
-    st.markdown("---")
-    st.subheader("Resultados")
-    st.dataframe(df, use_container_width=True)
-
-    if not df.empty:
-        timestamp = datetime.datetime.now(BRASILIA_TZ).strftime("%Y%m%d_%H%M%S")
-        excel_filename = f"CNPJ_Price_Tax_{timestamp}.xlsx"
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False, sheet_name='Resultados CNPJ')
-        st.download_button(
-            label="📥 Baixar Excel",
-            data=output.getvalue(),
-            file_name=excel_filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            help="Clique para baixar os resultados em .xlsx"
-        )
