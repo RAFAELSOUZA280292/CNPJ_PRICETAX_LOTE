@@ -51,6 +51,7 @@ st.markdown("""
 # Constantes / Globais
 # =========================
 URL_BRASILAPI_CNPJ = "https://brasilapi.com.br/api/cnpj/v1/"
+URL_IBGE_MUNS = "https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
 BRASILIA_TZ = ZoneInfo("America/Sao_Paulo")
 
 # Parâmetros de desempenho (fixos)
@@ -174,6 +175,31 @@ def mk_paths(job_id: str) -> Tuple[str, str]:
     xlsx_path = os.path.join(OUTPUT_DIR, f"resultado_{job_id}.xlsx")
     return csv_path, xlsx_path
 
+def ensure_autosave_header(csv_path: str, expected_cols: List[str]) -> None:
+    """Garante que o CSV tenha o cabeçalho esperado; migra se for diferente."""
+    if not os.path.exists(csv_path):
+        return
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            first_line = f.readline().strip()
+        current_cols = [c.strip() for c in first_line.split(";")] if first_line else []
+        if current_cols == expected_cols:
+            return
+
+        df_old = pd.read_csv(csv_path, sep=";", dtype=str, encoding="utf-8")
+        for col in expected_cols:
+            if col not in df_old.columns:
+                df_old[col] = ""
+        df_old = df_old[expected_cols]
+        df_old.to_csv(csv_path, sep=";", index=False, encoding="utf-8")
+    except Exception:
+        # fallback: preserva o antigo e cria novo
+        base, ext = os.path.splitext(csv_path)
+        try:
+            os.rename(csv_path, base + "_backup_old_header" + ext)
+        except Exception:
+            pass  # se não conseguir renomear, segue e cria novo na escrita
+
 def load_done_set(csv_path: str) -> Set[str]:
     done: Set[str] = set()
     if os.path.exists(csv_path):
@@ -227,6 +253,29 @@ class AdaptiveLimiter:
             if self.successes_since_last_adjust >= ADAPT_SUCC_WINDOW:
                 self.min_interval = max(self.min_interval * 0.85, MIN_INTERVAL_FLOOR)
                 self.successes_since_last_adjust = 0
+
+# =========================
+# Fallback IBGE (cache por UF)
+# =========================
+_IBGE_CACHE: Dict[str, Dict[str, str]] = {}
+
+def get_ibge_code_by_uf_city(uf: str, municipio: str) -> str:
+    """Obtém o código IBGE via Localidades/IBGE quando a BrasilAPI não trouxer `municipio_ibge`."""
+    try:
+        if not uf or not municipio:
+            return "N/A"
+        uf = uf.strip().upper()
+        municipio_norm = municipio.strip().lower()
+
+        if uf not in _IBGE_CACHE:
+            url = URL_IBGE_MUNS.format(uf=uf)
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            _IBGE_CACHE[uf] = {m["nome"].strip().lower(): str(m["id"]) for m in r.json()}
+
+        return _IBGE_CACHE[uf].get(municipio_norm, "N/A")
+    except Exception:
+        return "N/A"
 
 # =========================
 # Requisição com retry/backoff
@@ -304,11 +353,18 @@ def process_one_cnpj(original_cnpj_str: str, limiter: AdaptiveLimiter) -> Dict[s
             if api_data.get(x)
         ).strip() or "N/A"
 
+        municipio = api_data.get("municipio", "N/A")
+        uf = api_data.get("uf", "N/A")
+
+        ibge_code = api_data.get("municipio_ibge")
+        if ibge_code in (None, "", "0"):
+            ibge_code = get_ibge_code_by_uf_city(uf, municipio)
+
         row = {
             "CNPJ": original_cnpj_str,
             "Razao Social": api_data.get('razao_social', 'N/A'),
             "Nome Fantasia": api_data.get('nome_fantasia', 'N/A'),
-            "UF": api_data.get('uf', 'N/A'),
+            "UF": uf,
             "Simples Nacional": "SIM" if api_data.get('opcao_pelo_simples') else ("NÃO" if api_data.get('opcao_pelo_simples') is False else "N/A"),
             "MEI": "SIM" if api_data.get('opcao_pelo_mei') else ("NÃO" if api_data.get('opcao_pelo_mei') is False else "N/A"),
             "Regime Tributario": forma,
@@ -316,8 +372,8 @@ def process_one_cnpj(original_cnpj_str: str, limiter: AdaptiveLimiter) -> Dict[s
             "CNAE Principal": cnae_pri,
             "CNAE Secundario (primeiro)": cnae_sec,
             "Endereco": endereco,
-            "Municipio": api_data.get("municipio", "N/A"),
-            "Codigo IBGE Municipio": str(api_data.get("municipio_ibge", "N/A"))
+            "Municipio": municipio,
+            "Codigo IBGE Municipio": str(ibge_code) if ibge_code else "N/A"
         }
         cache_set(cleaned, row)
         return row
@@ -356,6 +412,9 @@ if st.button("🔱 Consultar em Lote"):
 
     job_id = mk_job_id(uniq_inputs)
     csv_autosave, xlsx_final = mk_paths(job_id)
+
+    # Garante header correto (migra se necessário)
+    ensure_autosave_header(csv_autosave, CSV_COLS)
 
     done_set = load_done_set(csv_autosave)
     to_do = [c for c in uniq_inputs if c not in done_set]
