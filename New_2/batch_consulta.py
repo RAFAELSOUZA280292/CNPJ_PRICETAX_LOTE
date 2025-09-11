@@ -10,6 +10,7 @@ import threading
 import hashlib
 import os
 import csv
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
@@ -79,7 +80,7 @@ CSV_COLS = [
     "CNPJ","Razao Social","Nome Fantasia","UF",
     "Simples Nacional","MEI","Regime Tributario","Ano Regime Tributario",
     "CNAE Principal","CNAE Secundario (primeiro)",
-    "Endereco","Municipio","Codigo IBGE Municipio"  # <<< NOVAS COLUNAS
+    "Endereco","Municipio","Codigo IBGE Municipio"
 ]
 
 # ---------- Cache global (thread-safe) ----------
@@ -127,8 +128,8 @@ def get_regime_tributario(regimes_list: Any) -> Tuple[str, str]:
     regimes_por_ano = {r.get('ano'): r.get('forma_de_tributacao') for r in regimes_list if isinstance(r, dict)}
     current_year = datetime.datetime.now().year
     for y in [current_year - i for i in range(6)]:
-        if y in regimes_por_ano and regimes_por_ano[y]:
-            return regimes_por_ano[y], str(y)
+        if y in regimes_por_ano and regimes_por_ao[y]:
+            return regimes_por_ao[y], str(y)
     latest = max((r for r in regimes_list if isinstance(r, dict) and r.get('ano') is not None),
                  key=lambda x: x['ano'], default=None)
     if latest:
@@ -193,12 +194,11 @@ def ensure_autosave_header(csv_path: str, expected_cols: List[str]) -> None:
         df_old = df_old[expected_cols]
         df_old.to_csv(csv_path, sep=";", index=False, encoding="utf-8")
     except Exception:
-        # fallback: preserva o antigo e cria novo
         base, ext = os.path.splitext(csv_path)
         try:
             os.rename(csv_path, base + "_backup_old_header" + ext)
         except Exception:
-            pass  # se não conseguir renomear, segue e cria novo na escrita
+            pass
 
 def load_done_set(csv_path: str) -> Set[str]:
     done: Set[str] = set()
@@ -221,7 +221,6 @@ def append_rows_csv(csv_path: str, rows: List[Dict[str, Any]]) -> int:
         if not file_exists:
             w.writeheader()
         for r in rows:
-            # garante chaves ausentes como ""
             safe = {k: ("" if r.get(k) is None else str(r.get(k))) for k in CSV_COLS}
             w.writerow(safe)
     return len(rows)
@@ -255,25 +254,46 @@ class AdaptiveLimiter:
                 self.successes_since_last_adjust = 0
 
 # =========================
-# Fallback IBGE (cache por UF)
+# Fallback IBGE (sem acento/caixa, cache por UF)
 # =========================
 _IBGE_CACHE: Dict[str, Dict[str, str]] = {}
 
+def _norm_txt(s: str) -> str:
+    """Remove acentos, baixa caixa e colapsa separadores para comparação."""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode("ascii")  # remove acentos
+    s = s.lower().strip()
+    for ch in ["-", "–", "—", "/", "\\", ",", "."]:
+        s = s.replace(ch, " ")
+    s = " ".join(s.split())
+    return s
+
 def get_ibge_code_by_uf_city(uf: str, municipio: str) -> str:
-    """Obtém o código IBGE via Localidades/IBGE quando a BrasilAPI não trouxer `municipio_ibge`."""
+    """Obtém o código IBGE via Localidades/IBGE quando BrasilAPI não traz `municipio_ibge`."""
     try:
         if not uf or not municipio:
             return "N/A"
         uf = uf.strip().upper()
-        municipio_norm = municipio.strip().lower()
+        m_norm = _norm_txt(municipio)
 
         if uf not in _IBGE_CACHE:
             url = URL_IBGE_MUNS.format(uf=uf)
             r = requests.get(url, timeout=10)
             r.raise_for_status()
-            _IBGE_CACHE[uf] = {m["nome"].strip().lower(): str(m["id"]) for m in r.json()}
+            _IBGE_CACHE[uf] = {_norm_txt(m["nome"]): str(m["id"]) for m in r.json()}
 
-        return _IBGE_CACHE[uf].get(municipio_norm, "N/A")
+        code = _IBGE_CACHE[uf].get(m_norm)
+        if code:
+            return code
+
+        # Fallback: começa/contém (para nomes compostos)
+        for k, v in _IBGE_CACHE[uf].items():
+            if m_norm.startswith(k) or k.startswith(m_norm):
+                return v
+
+        return "N/A"
     except Exception:
         return "N/A"
 
@@ -346,7 +366,6 @@ def process_one_cnpj(original_cnpj_str: str, limiter: AdaptiveLimiter) -> Dict[s
         forma, ano = get_regime_tributario(api_data.get("regime_tributario", []))
         cnae_pri, cnae_sec = extrair_cnaes(api_data)
 
-        # Endereço compacto (logradouro, número, compl., bairro)
         endereco = " ".join(
             str(api_data.get(x, "")).strip()
             for x in ["logradouro", "numero", "complemento", "bairro"]
@@ -424,7 +443,6 @@ if st.button("🔱 Consultar em Lote"):
         f"Já concluídos: **{len(done_set)}**  •  Restantes: **{len(to_do)}**"
     )
 
-    # Guarda todas as linhas processadas nesta execução (para mostrar mesmo se FS estiver lento)
     all_rows_this_run: List[Dict[str, Any]] = []
 
     if to_do:
@@ -493,7 +511,6 @@ if st.button("🔱 Consultar em Lote"):
             st.warning(f"Não consegui ler o autosave agora ({e}). Vou mostrar o que foi obtido nesta execução.")
             df_full = pd.DataFrame(all_rows_this_run, columns=CSV_COLS)
 
-    # fallback: se a leitura deu 0 linhas mas temos linhas em memória, mostro em memória
     if df_full.empty and all_rows_this_run:
         df_full = pd.DataFrame(all_rows_this_run, columns=CSV_COLS)
 
