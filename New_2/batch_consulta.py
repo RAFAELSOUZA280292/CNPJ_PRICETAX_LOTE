@@ -77,7 +77,8 @@ OUTPUT_DIR = "autosave_cnpj"
 CSV_COLS = [
     "CNPJ","Razao Social","Nome Fantasia","UF",
     "Simples Nacional","MEI","Regime Tributario","Ano Regime Tributario",
-    "CNAE Principal","CNAE Secundario (primeiro)"
+    "CNAE Principal","CNAE Secundario (primeiro)",
+    "Endereco","Municipio"  # <<< NOVAS COLUNAS
 ]
 
 # ---------- Cache global (thread-safe) ----------
@@ -283,16 +284,26 @@ def process_one_cnpj(original_cnpj_str: str, limiter: AdaptiveLimiter) -> Dict[s
             "Nome Fantasia": 'N/A', "UF": 'N/A',
             "Simples Nacional": 'N/A', "MEI": 'N/A',
             "Regime Tributario": 'N/A', "Ano Regime Tributario": 'N/A',
-            "CNAE Principal": 'N/A', "CNAE Secundario (primeiro)": 'N/A'
+            "CNAE Principal": 'N/A', "CNAE Secundario (primeiro)": 'N/A',
+            "Endereco": "N/A", "Municipio": "N/A"  # <<< NOVO
         }
     cached = cache_get(cleaned)
     if cached is not None:
         out = dict(cached); out["CNPJ"] = original_cnpj_str; return out
+
     cnpj_to_query = to_matriz_if_filial(cleaned)
     api_data, err_msg = request_cnpj_with_retry(cnpj_to_query, limiter)
     if api_data and "cnpj" in api_data:
         forma, ano = get_regime_tributario(api_data.get("regime_tributario", []))
         cnae_pri, cnae_sec = extrair_cnaes(api_data)
+
+        # Monta o endereço a partir dos campos disponíveis
+        endereco = " ".join(
+            str(api_data.get(x, "")).strip()
+            for x in ["logradouro", "numero", "complemento", "bairro"]
+            if api_data.get(x)
+        ).strip() or "N/A"
+
         row = {
             "CNPJ": original_cnpj_str,
             "Razao Social": api_data.get('razao_social', 'N/A'),
@@ -304,9 +315,12 @@ def process_one_cnpj(original_cnpj_str: str, limiter: AdaptiveLimiter) -> Dict[s
             "Ano Regime Tributario": ano,
             "CNAE Principal": cnae_pri,
             "CNAE Secundario (primeiro)": cnae_sec,
+            "Endereco": endereco,                                   # <<< NOVO
+            "Municipio": api_data.get("municipio", "N/A")           # <<< NOVO
         }
         cache_set(cleaned, row)
         return row
+
     msg = err_msg or "Falha desconhecida"
     return {
         "CNPJ": original_cnpj_str,
@@ -314,7 +328,8 @@ def process_one_cnpj(original_cnpj_str: str, limiter: AdaptiveLimiter) -> Dict[s
         "Nome Fantasia": 'N/A', "UF": 'N/A',
         "Simples Nacional": 'N/A', "MEI": 'N/A',
         "Regime Tributario": 'N/A', "Ano Regime Tributario": 'N/A',
-        "CNAE Principal": 'N/A', "CNAE Secundario (primeiro)": 'N/A'
+        "CNAE Principal": 'N/A', "CNAE Secundario (primeiro)": 'N/A',
+        "Endereco": "N/A", "Municipio": "N/A"  # <<< NOVO
     }
 
 # =========================
