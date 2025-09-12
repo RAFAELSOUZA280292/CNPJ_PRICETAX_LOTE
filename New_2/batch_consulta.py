@@ -10,6 +10,7 @@ import threading
 import hashlib
 import os
 import csv
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
@@ -53,10 +54,11 @@ st.markdown("""
 # Constantes / Globais
 # =========================
 URL_BRASILAPI_CNPJ = "https://brasilapi.com.br/api/cnpj/v1/"
+URL_IBGE_MUNS      = "https://servicodados.ibge.gov.br/api/v1/localidades/estados/{uf}/municipios"
 BRASILIA_TZ = ZoneInfo("America/Sao_Paulo")
 
 # Parâmetros de desempenho
-MAX_WORKERS = 3
+MAX_WORKERS   = 3
 START_INTERVAL = 1.0
 
 # Limitador adaptativo
@@ -76,23 +78,25 @@ MAX_INPUTS = 1000
 AUTOSAVE_BLOCK = 10
 OUTPUT_DIR = "autosave_cnpj"
 
+# Layout fixo do CSV (garante consistência!)
 CSV_COLS = [
     "CNPJ_ORIGINAL","CNPJ_LIMPO","Razao Social","Nome Fantasia","UF",
     "Simples Nacional","MEI","Regime Tributario","Ano Regime Tributario",
-    "CNAE Principal","CNAE Secundario (primeiro)","TIMESTAMP"
+    "CNAE Principal","CNAE Secundario (primeiro)",
+    "Endereco","Municipio","Codigo IBGE Municipio","TIMESTAMP"
 ]
 
 # ---------- Cache global (thread-safe) ----------
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_LOCK = threading.Lock()
 
-def cache_get(cnpj14: str) -> Optional[Dict[str, Any]]:
+def cache_get(cnpj_key: str) -> Optional[Dict[str, Any]]:
     with _CACHE_LOCK:
-        return _CACHE.get(cnpj14)
+        return _CACHE.get(cnpj_key)
 
-def cache_set(cnpj14: str, data: Dict[str, Any]) -> None:
+def cache_set(cnpj_key: str, data: Dict[str, Any]) -> None:
     with _CACHE_LOCK:
-        _CACHE[cnpj14] = data
+        _CACHE[cnpj_key] = data
 
 # ---------- Pool de sessões por thread ----------
 _thread_local = threading.local()
@@ -104,11 +108,7 @@ def get_session() -> requests.Session:
         adapter = HTTPAdapter(
             pool_connections=MAX_WORKERS * 2,
             pool_maxsize=MAX_WORKERS * 4,
-            max_retries=Retry(
-                total=0,  # retries manuais no nosso código
-                backoff_factor=0,
-                status_forcelist=[]
-            )
+            max_retries=Retry(total=0, backoff_factor=0, status_forcelist=[])
         )
         s.mount("http://", adapter)
         s.mount("https://", adapter)
@@ -138,8 +138,6 @@ def calcular_digitos_verificadores_cnpj(cnpj_base_12_digitos: str) -> str:
     return d13 + d14
 
 def to_matriz_if_filial(cnpj_clean: str) -> str:
-    """Retorna CNPJ da matriz (0001) com DVs corrigidos.
-       Obs.: Mantido como utilitário para a opção 'forçar matriz'."""
     if len(cnpj_clean) != 14:
         return cnpj_clean
     if cnpj_clean[8:12] != "0001":
@@ -203,6 +201,29 @@ def mk_paths(job_id: str) -> Tuple[str, str]:
     xlsx_path = os.path.join(OUTPUT_DIR, f"resultado_{job_id}.xlsx")
     return csv_path, xlsx_path
 
+def ensure_autosave_header(csv_path: str, expected_cols: List[str]) -> None:
+    """Garante cabeçalho consistente; migra se estiver diferente."""
+    if not os.path.exists(csv_path):
+        return
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            first_line = f.readline().strip()
+        current_cols = [c.strip() for c in first_line.split(";")] if first_line else []
+        if current_cols == expected_cols:
+            return
+        df_old = pd.read_csv(csv_path, sep=";", dtype=str, encoding="utf-8")
+        for col in expected_cols:
+            if col not in df_old.columns:
+                df_old[col] = ""
+        df_old = df_old[expected_cols]
+        df_old.to_csv(csv_path, sep=";", index=False, encoding="utf-8")
+    except Exception:
+        base, ext = os.path.splitext(csv_path)
+        try:
+            os.rename(csv_path, base + "_backup_old_header" + ext)
+        except Exception:
+            pass
+
 def load_done_set(csv_path: str) -> Set[str]:
     done: Set[str] = set()
     if os.path.exists(csv_path):
@@ -215,7 +236,7 @@ def load_done_set(csv_path: str) -> Set[str]:
             pass
     return done
 
-# —— Escrita robusta com csv.DictWriter
+# —— Escrita robusta com csv.DictWriter (sempre no layout CSV_COLS)
 def append_rows_csv(csv_path: str, rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
@@ -258,15 +279,48 @@ class AdaptiveLimiter:
                 self.successes_since_last_adjust = 0
 
 # =========================
+# IBGE fallback (normalizado e cacheado por UF)
+# =========================
+_IBGE_CACHE: Dict[str, Dict[str, str]] = {}
+
+def _norm_txt(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = s.lower().strip()
+    for ch in ["-", "–", "—", "/", "\\", ",", "."]:
+        s = s.replace(ch, " ")
+    return " ".join(s.split())
+
+def get_ibge_code_by_uf_city(uf: str, municipio: str) -> str:
+    try:
+        if not uf or not municipio:
+            return "N/A"
+        uf = uf.strip().upper()
+        m_norm = _norm_txt(municipio)
+        if uf not in _IBGE_CACHE:
+            url = URL_IBGE_MUNS.format(uf=uf)
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            _IBGE_CACHE[uf] = { _norm_txt(m["nome"]): str(m["id"]) for m in r.json() }
+        code = _IBGE_CACHE[uf].get(m_norm)
+        if code:
+            return code
+        for k, v in _IBGE_CACHE[uf].items():
+            if m_norm.startswith(k) or k.startswith(m_norm):
+                return v
+        return "N/A"
+    except Exception:
+        return "N/A"
+
+# =========================
 # Requisição com retry/backoff
 # =========================
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 def _sleep_backoff(base_min_interval: float, attempt: int) -> None:
     base = max(base_min_interval, 1.0)
-    # exponencial com jitter
-    sleep_s = min(base * (2 ** (attempt - 1)) + random.uniform(0, 0.6), MIN_INTERVAL_CEIL)
-    time.sleep(sleep_s)
+    time.sleep(min(base * (2 ** (attempt - 1)) + random.uniform(0, 0.6), MIN_INTERVAL_CEIL))
 
 def request_cnpj_with_retry(cnpj_query: str, limiter: AdaptiveLimiter) -> Tuple[Optional[Dict[str, Any]], str]:
     last_err = None
@@ -292,15 +346,10 @@ def request_cnpj_with_retry(cnpj_query: str, limiter: AdaptiveLimiter) -> Tuple[
             limiter.reward()
             return data, None
         except requests.exceptions.Timeout:
-            limiter.penalize()
-            _sleep_backoff(limiter.min_interval, attempt)
-            last_err = "Timeout"
+            limiter.penalize(); _sleep_backoff(limiter.min_interval, attempt); last_err = "Timeout"
         except requests.exceptions.ConnectionError:
-            limiter.penalize()
-            _sleep_backoff(limiter.min_interval, attempt)
-            last_err = "ConnectionError"
+            limiter.penalize(); _sleep_backoff(limiter.min_interval, attempt); last_err = "ConnectionError"
         except requests.exceptions.HTTPError as e:
-            # Erros não retryable: devolve a mensagem da API (quando disponível)
             try:
                 j = e.response.json()
                 msg = j.get("message") or j.get("type") or str(e)
@@ -314,41 +363,62 @@ def request_cnpj_with_retry(cnpj_query: str, limiter: AdaptiveLimiter) -> Tuple[
     return None, last_err or "Falha desconhecida"
 
 # =========================
-# Pipeline de 1 CNPJ
+# Montagem de linha (sempre obedece CSV_COLS)
 # =========================
-def montar_row(
-    original_cnpj_str: str,
-    cnpj_limpo: str,
-    api_data: Optional[Dict[str, Any]],
-    err_msg: Optional[str]
-) -> Dict[str, Any]:
+def montar_row(original_cnpj_str: str, cnpj_limpo: str,
+               api_data: Optional[Dict[str, Any]], err_msg: Optional[str]) -> Dict[str, Any]:
     ts = datetime.datetime.now(BRASILIA_TZ).strftime("%Y-%m-%d %H:%M:%S")
     if api_data and "cnpj" in api_data:
         forma, ano = get_regime_tributario(api_data.get("regime_tributario", []))
         cnae_pri, cnae_sec = extrair_cnaes(api_data)
+
+        endereco = " ".join(
+            str(api_data.get(x, "")).strip()
+            for x in ["logradouro", "numero", "complemento", "bairro"]
+            if api_data.get(x)
+        ).strip() or "N/A"
+
+        municipio = api_data.get("municipio", "N/A")
+        uf = api_data.get("uf", "N/A")
+
+        ibge = api_data.get("municipio_ibge")
+        if ibge in (None, "", "0"):
+            ibge = get_ibge_code_by_uf_city(uf, municipio)
+
         return {
             "CNPJ_ORIGINAL": original_cnpj_str,
             "CNPJ_LIMPO": cnpj_limpo,
             "Razao Social": api_data.get('razao_social', 'N/A'),
             "Nome Fantasia": api_data.get('nome_fantasia', 'N/A'),
-            "UF": api_data.get('uf', 'N/A'),
+            "UF": uf,
             "Simples Nacional": "SIM" if api_data.get('opcao_pelo_simples') else ("NÃO" if api_data.get('opcao_pelo_simples') is False else "N/A"),
             "MEI": "SIM" if api_data.get('opcao_pelo_mei') else ("NÃO" if api_data.get('opcao_pelo_mei') is False else "N/A"),
             "Regime Tributario": forma,
             "Ano Regime Tributario": ano,
             "CNAE Principal": cnae_pri,
             "CNAE Secundario (primeiro)": cnae_sec,
+            "Endereco": endereco,
+            "Municipio": municipio,
+            "Codigo IBGE Municipio": str(ibge) if ibge else "N/A",
             "TIMESTAMP": ts
         }
+
     msg = err_msg or "Falha desconhecida"
     return {
         "CNPJ_ORIGINAL": original_cnpj_str,
         "CNPJ_LIMPO": cnpj_limpo,
         "Razao Social": msg,
-        "Nome Fantasia": 'N/A', "UF": 'N/A',
-        "Simples Nacional": 'N/A', "MEI": 'N/A',
-        "Regime Tributario": 'N/A', "Ano Regime Tributario": 'N/A',
-        "CNAE Principal": 'N/A', "CNAE Secundario (primeiro)": 'N/A',
+        "Nome Fantasia": 'N/A',
+        "UF": 'N/A',
+        "Simples Nacional": 'N/A',
+        "MEI": 'N/A',
+        "Regime Tributario": 'N/A',
+        "Ano Regime Tributario": 'N/A',
+        "CNAE Principal": 'N/A',
+        "CNAE Secundario (primeiro)": 'N/A',
+        "Endereco": "N/A",
+        "Municipio": "N/A",
+        "Codigo IBGE Municipio": "N/A",
         "TIMESTAMP": ts
     }
 
@@ -357,20 +427,17 @@ def process_one_cnpj(original_cnpj_str: str, limiter: AdaptiveLimiter, force_mat
     if not cnpj_is_valid(cleaned):
         return montar_row(original_cnpj_str, cleaned, None, "CNPJ inválido (DV)")
 
-    cached = cache_get(cleaned if not force_matriz else to_matriz_if_filial(cleaned))
+    query_key = to_matriz_if_filial(cleaned) if force_matriz else cleaned
+    cached = cache_get(query_key)
     if cached is not None:
         out = dict(cached)
         out["CNPJ_ORIGINAL"] = original_cnpj_str
         out["CNPJ_LIMPO"] = cleaned
         return out
 
-    cnpj_to_query = to_matriz_if_filial(cleaned) if force_matriz else cleaned
-    api_data, err_msg = request_cnpj_with_retry(cnpj_to_query, limiter)
-
+    api_data, err_msg = request_cnpj_with_retry(query_key, limiter)
     row = montar_row(original_cnpj_str, cleaned, api_data, err_msg)
-    # cache por chave consultada (para evitar repetição)
-    cache_key = cnpj_to_query
-    cache_set(cache_key, row)
+    cache_set(query_key, row)
     return row
 
 # =========================
@@ -410,16 +477,17 @@ if st.button("🔱 Consultar em Lote", help="Inicia a consulta com limiter adapt
     job_id = mk_job_id(normalized)
     csv_autosave, xlsx_final = mk_paths(job_id)
 
+    # Garante header correto ANTES de qualquer escrita/leitura
+    ensure_autosave_header(csv_autosave, CSV_COLS)
+
     done_set = load_done_set(csv_autosave)  # já normalizado
-    to_do_orig = []   # manter referência ao texto original para a primeira ocorrência
+    to_do_orig: List[str] = []
     seen_clean: Set[str] = set()
 
     # Mapeia o primeiro texto original para cada CNPJ limpo
     for original in uniq_inputs:
         c = limpar_cnpj(original)
-        if not c:
-            continue
-        if c in seen_clean:
+        if not c or c in seen_clean:
             continue
         seen_clean.add(c)
         if c not in done_set:
@@ -458,7 +526,7 @@ if st.button("🔱 Consultar em Lote", help="Inicia a consulta com limiter adapt
                 all_rows_this_run.append(row)
                 processed_now += 1
 
-                # Autosave por bloco
+                # Autosave por bloco (layout sempre CSV_COLS)
                 if len(buffer_rows) >= AUTOSAVE_BLOCK:
                     written = append_rows_csv(csv_autosave, buffer_rows)
                     size_kb = os.path.getsize(csv_autosave) / 1024 if os.path.exists(csv_autosave) else 0
@@ -480,7 +548,7 @@ if st.button("🔱 Consultar em Lote", help="Inicia a consulta com limiter adapt
                     f"🕒 **Previsão de término:** {finish_time.strftime('%H:%M:%S')}"
                 )
 
-        # flush final
+        # Flush final
         if buffer_rows:
             written = append_rows_csv(csv_autosave, buffer_rows)
             size_kb = os.path.getsize(csv_autosave) / 1024 if os.path.exists(csv_autosave) else 0
@@ -493,7 +561,7 @@ if st.button("🔱 Consultar em Lote", help="Inicia a consulta com limiter adapt
     st.subheader("Resultados (consolidados do autosave)")
 
     df_full = pd.DataFrame(columns=CSV_COLS)
-    if os.path.exists(csv_autosave):
+    if os.path.exists(csv_autosave)):
         try:
             df_full = pd.read_csv(csv_autosave, sep=";", dtype=str, encoding="utf-8")
         except Exception as e:
