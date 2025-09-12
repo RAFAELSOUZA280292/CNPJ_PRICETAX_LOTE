@@ -58,7 +58,7 @@ URL_IBGE_MUNS      = "https://servicodados.ibge.gov.br/api/v1/localidades/estado
 BRASILIA_TZ = ZoneInfo("America/Sao_Paulo")
 
 # Parâmetros de desempenho
-MAX_WORKERS   = 3
+MAX_WORKERS    = 3
 START_INTERVAL = 1.0
 
 # Limitador adaptativo
@@ -78,7 +78,7 @@ MAX_INPUTS = 1000
 AUTOSAVE_BLOCK = 10
 OUTPUT_DIR = "autosave_cnpj"
 
-# Layout fixo do CSV (garante consistência!)
+# Layout fixo do CSV (ordem imutável!)
 CSV_COLS = [
     "CNPJ_ORIGINAL","CNPJ_LIMPO","Razao Social","Nome Fantasia","UF",
     "Simples Nacional","MEI","Regime Tributario","Ano Regime Tributario",
@@ -155,8 +155,10 @@ def get_regime_tributario(regimes_list: Any) -> Tuple[str, str]:
     for y in [current_year - i for i in range(6)]:
         if y in regimes_por_ano and regimes_por_ano[y]:
             return regimes_por_ano[y], str(y)
-    latest = max((r for r in regimes_list if isinstance(r, dict) and r.get('ano') is not None),
-                 key=lambda x: x['ano'], default=None)
+    latest = max(
+        (r for r in regimes_list if isinstance(r, dict) and r.get('ano') is not None),
+        key=lambda x: x['ano'], default=None
+    )
     if latest:
         return latest.get('forma_de_tributacao', "N/A"), str(latest.get('ano', "N/A"))
     return "N/A", "N/A"
@@ -302,7 +304,7 @@ def get_ibge_code_by_uf_city(uf: str, municipio: str) -> str:
             url = URL_IBGE_MUNS.format(uf=uf)
             r = requests.get(url, timeout=10)
             r.raise_for_status()
-            _IBGE_CACHE[uf] = { _norm_txt(m["nome"]): str(m["id"]) for m in r.json() }
+            _IBGE_CACHE[uf] = {_norm_txt(m["nome"]): str(m["id"]) for m in r.json()}
         code = _IBGE_CACHE[uf].get(m_norm)
         if code:
             return code
@@ -561,7 +563,7 @@ if st.button("🔱 Consultar em Lote", help="Inicia a consulta com limiter adapt
     st.subheader("Resultados (consolidados do autosave)")
 
     df_full = pd.DataFrame(columns=CSV_COLS)
-    if os.path.exists(csv_autosave)):
+    if os.path.exists(csv_autosave):
         try:
             df_full = pd.read_csv(csv_autosave, sep=";", dtype=str, encoding="utf-8")
         except Exception as e:
