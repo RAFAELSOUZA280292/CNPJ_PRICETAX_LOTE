@@ -78,10 +78,11 @@ MAX_INPUTS = 1000
 AUTOSAVE_BLOCK = 10
 OUTPUT_DIR = "autosave_cnpj"
 
-# ===== Layout fixo do CSV (ordem imutável pós-ajustes) =====
+# ===== Layout fixo do CSV (ordem imutável) =====
 CSV_COLS = [
     "CNPJ_ORIGINAL","CNPJ_LIMPO","Razao Social","UF",
-    "Municipio","Endereco","Regime Tributario","Ano Regime Tributario",
+    "Municipio","Endereco",
+    "Regime Tributario","Regime","Ano Regime Tributario",
     "Simples Nacional","MEI",
     "CNAE Principal","CNAE Secundario (primeiro)",
     "Codigo IBGE Municipio","TIMESTAMP"
@@ -149,6 +150,10 @@ def to_matriz_if_filial(cnpj_clean: str) -> str:
     return cnpj_clean
 
 def get_regime_tributario(regimes_list: Any) -> Tuple[str, str]:
+    """
+    Retorna (forma_de_tributacao, ano). Ex.: ('Lucro Real', '2023')
+    Se não houver dados, retorna ('N/A', 'N/A').
+    """
     if not isinstance(regimes_list, list) or not regimes_list:
         return "N/A", "N/A"
     regimes_por_ano = {r.get('ano'): r.get('forma_de_tributacao') for r in regimes_list if isinstance(r, dict)}
@@ -218,7 +223,6 @@ def ensure_autosave_header(csv_path: str, expected_cols: List[str]) -> None:
         for col in expected_cols:
             if col not in df_old.columns:
                 df_old[col] = ""
-        # remove colunas extras que não existem mais
         df_old = df_old[[c for c in expected_cols]]
         df_old.to_csv(csv_path, sep=";", index=False, encoding="utf-8")
     except Exception:
@@ -372,8 +376,23 @@ def request_cnpj_with_retry(cnpj_query: str, limiter: AdaptiveLimiter) -> Tuple[
 def montar_row(original_cnpj_str: str, cnpj_limpo: str,
                api_data: Optional[Dict[str, Any]], err_msg: Optional[str]) -> Dict[str, Any]:
     ts = datetime.datetime.now(BRASILIA_TZ).strftime("%Y-%m-%d %H:%M:%S")
+
     if api_data and "cnpj" in api_data:
+        # --- Lê Simples/MEI para classificar "Regime Tributario"
+        simples_flag = api_data.get('opcao_pelo_simples')
+        mei_flag     = api_data.get('opcao_pelo_mei')
+
+        if simples_flag:
+            regime_tributario = "Simples"
+        elif mei_flag:
+            regime_tributario = "MEI"
+        else:
+            regime_tributario = "NORMAL"
+
+        # --- Regime (forma histórica: Lucro Real/Presumido, etc.)
         forma, ano = get_regime_tributario(api_data.get("regime_tributario", []))
+
+        # --- Demais campos
         cnae_pri, cnae_sec = extrair_cnaes(api_data)
 
         endereco = " ".join(
@@ -396,16 +415,18 @@ def montar_row(original_cnpj_str: str, cnpj_limpo: str,
             "UF": uf,
             "Municipio": municipio,
             "Endereco": endereco,
-            "Regime Tributario": forma,
+            "Regime Tributario": regime_tributario,
+            "Regime": forma,
             "Ano Regime Tributario": ano,
-            "Simples Nacional": "SIM" if api_data.get('opcao_pelo_simples') else ("NÃO" if api_data.get('opcao_pelo_simples') is False else "N/A"),
-            "MEI": "SIM" if api_data.get('opcao_pelo_mei') else ("NÃO" if api_data.get('opcao_pelo_mei') is False else "N/A"),
+            "Simples Nacional": "SIM" if simples_flag else ("NÃO" if simples_flag is False else "N/A"),
+            "MEI": "SIM" if mei_flag else ("NÃO" if mei_flag is False else "N/A"),
             "CNAE Principal": cnae_pri,
             "CNAE Secundario (primeiro)": cnae_sec,
             "Codigo IBGE Municipio": str(ibge) if ibge else "N/A",
             "TIMESTAMP": ts
         }
 
+    # Caso de erro (sem api_data)
     msg = err_msg or "Falha desconhecida"
     return {
         "CNPJ_ORIGINAL": original_cnpj_str,
@@ -415,6 +436,7 @@ def montar_row(original_cnpj_str: str, cnpj_limpo: str,
         "Municipio": "N/A",
         "Endereco": "N/A",
         "Regime Tributario": 'N/A',
+        "Regime": 'N/A',
         "Ano Regime Tributario": 'N/A',
         "Simples Nacional": 'N/A',
         "MEI": 'N/A',
@@ -566,7 +588,7 @@ if st.button("🔱 Consultar em Lote", help="Inicia a consulta com limiter adapt
     if os.path.exists(csv_autosave):
         try:
             df_full = pd.read_csv(csv_autosave, sep=";", dtype=str, encoding="utf-8")
-            # Garantir colunas na ordem certa mesmo se arquivo antigo tiver colunas extras
+            # Garante colunas na ordem certa mesmo se arquivo antigo tiver colunas extras
             df_full = df_full.reindex(columns=CSV_COLS)
         except Exception as e:
             st.warning(f"Não consegui ler o autosave agora ({e}). Vou mostrar o que foi obtido nesta execução.")
