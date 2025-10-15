@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import re
 import pandas as pd
+import numpy as np
 import time
 import datetime
 import io
@@ -78,7 +79,7 @@ MAX_INPUTS = 1000
 AUTOSAVE_BLOCK = 10
 OUTPUT_DIR = "autosave_cnpj"
 
-# ===== Layout fixo do CSV (ordem imutável) =====
+# ===== Layout fixo do CSV =====
 CSV_COLS = [
     "CNPJ_ORIGINAL","CNPJ_LIMPO","Razao Social","UF",
     "Municipio","Endereco",
@@ -150,10 +151,6 @@ def to_matriz_if_filial(cnpj_clean: str) -> str:
     return cnpj_clean
 
 def get_regime_tributario(regimes_list: Any) -> Tuple[str, str]:
-    """
-    Retorna (forma_de_tributacao, ano). Ex.: ('Lucro Real', '2023')
-    Se não houver dados, retorna ('N/A', 'N/A').
-    """
     if not isinstance(regimes_list, list) or not regimes_list:
         return "N/A", "N/A"
     regimes_por_ano = {r.get('ano'): r.get('forma_de_tributacao') for r in regimes_list if isinstance(r, dict)}
@@ -209,22 +206,56 @@ def mk_paths(job_id: str) -> Tuple[str, str]:
     xlsx_path = os.path.join(OUTPUT_DIR, f"resultado_{job_id}.xlsx")
     return csv_path, xlsx_path
 
+# ---------- Funções de migração/saneamento ----------
+def apply_regime_rules(df: pd.DataFrame) -> pd.DataFrame:
+    """Garante a regra nova para TODAS as linhas."""
+    s = (df.get("Simples Nacional") or pd.Series([], dtype=str)).fillna("")
+    m = (df.get("MEI") or pd.Series([], dtype=str)).fillna("")
+    df["Regime Tributario"] = np.where(
+        s.str.upper().str.strip() == "SIM", "Simples",
+        np.where(m.str.upper().str.strip() == "SIM", "MEI", "NORMAL")
+    )
+    return df
+
+def migrate_old_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Migra CSV antigo:
+       - cria 'Regime' a partir do antigo 'Regime Tributario' quando parecer 'Lucro ...'
+       - recalcula 'Regime Tributario' pela regra Simples/MEI
+    """
+    # cria coluna Regime se não existir
+    if "Regime" not in df.columns:
+        df["Regime"] = ""
+
+    # se 'Regime' estiver vazio e 'Regime Tributario' tiver 'Lucro ...', movemos para 'Regime'
+    mask_lucro = df.get("Regime Tributario", pd.Series([], dtype=str)).str.contains(r"(?i)^lucro\s", na=False)
+    df.loc[mask_lucro & (df["Regime"].eq("") | df["Regime"].isna()), "Regime"] = df.loc[mask_lucro, "Regime Tributario"]
+
+    # aplica regra nova para 'Regime Tributario'
+    df = apply_regime_rules(df)
+
+    # garante colunas faltantes
+    for col in CSV_COLS:
+        if col not in df.columns:
+            df[col] = ""
+
+    # reordena
+    df = df.reindex(columns=CSV_COLS)
+    return df
+
 def ensure_autosave_header(csv_path: str, expected_cols: List[str]) -> None:
-    """Garante cabeçalho consistente; migra se estiver diferente."""
+    """Garante cabeçalho consistente; migra dados antigos para o novo layout."""
     if not os.path.exists(csv_path):
         return
     try:
         with open(csv_path, "r", encoding="utf-8") as f:
             first_line = f.readline().strip()
         current_cols = [c.strip() for c in first_line.split(";")] if first_line else []
-        if current_cols == expected_cols:
-            return
-        df_old = pd.read_csv(csv_path, sep=";", dtype=str, encoding="utf-8")
-        for col in expected_cols:
-            if col not in df_old.columns:
-                df_old[col] = ""
-        df_old = df_old[[c for c in expected_cols]]
-        df_old.to_csv(csv_path, sep=";", index=False, encoding="utf-8")
+
+        df_old = pd.read_csv(csv_path, sep=";", dtype=str, encoding="utf-8") if os.path.getsize(csv_path) > 0 else pd.DataFrame()
+
+        if current_cols != expected_cols or any(c not in df_old.columns for c in expected_cols):
+            df_migr = migrate_old_columns(df_old.copy()) if not df_old.empty else pd.DataFrame(columns=expected_cols)
+            df_migr.to_csv(csv_path, sep=";", index=False, encoding="utf-8")
     except Exception:
         base, ext = os.path.splitext(csv_path)
         try:
@@ -244,7 +275,7 @@ def load_done_set(csv_path: str) -> Set[str]:
             pass
     return done
 
-# —— Escrita robusta com csv.DictWriter (sempre no layout CSV_COLS)
+# —— Escrita robusta com csv.DictWriter (layout CSV_COLS)
 def append_rows_csv(csv_path: str, rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
@@ -371,28 +402,24 @@ def request_cnpj_with_retry(cnpj_query: str, limiter: AdaptiveLimiter) -> Tuple[
     return None, last_err or "Falha desconhecida"
 
 # =========================
-# Montagem de linha (sempre obedece CSV_COLS)
+# Montagem de linha
 # =========================
 def montar_row(original_cnpj_str: str, cnpj_limpo: str,
                api_data: Optional[Dict[str, Any]], err_msg: Optional[str]) -> Dict[str, Any]:
     ts = datetime.datetime.now(BRASILIA_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
     if api_data and "cnpj" in api_data:
-        # --- Lê Simples/MEI para classificar "Regime Tributario"
         simples_flag = api_data.get('opcao_pelo_simples')
         mei_flag     = api_data.get('opcao_pelo_mei')
 
         if simples_flag:
-            regime_tributario = "Simples"
+            regime_trib = "Simples"
         elif mei_flag:
-            regime_tributario = "MEI"
+            regime_trib = "MEI"
         else:
-            regime_tributario = "NORMAL"
+            regime_trib = "NORMAL"
 
-        # --- Regime (forma histórica: Lucro Real/Presumido, etc.)
         forma, ano = get_regime_tributario(api_data.get("regime_tributario", []))
-
-        # --- Demais campos
         cnae_pri, cnae_sec = extrair_cnaes(api_data)
 
         endereco = " ".join(
@@ -415,7 +442,7 @@ def montar_row(original_cnpj_str: str, cnpj_limpo: str,
             "UF": uf,
             "Municipio": municipio,
             "Endereco": endereco,
-            "Regime Tributario": regime_tributario,
+            "Regime Tributario": regime_trib,
             "Regime": forma,
             "Ano Regime Tributario": ano,
             "Simples Nacional": "SIM" if simples_flag else ("NÃO" if simples_flag is False else "N/A"),
@@ -426,7 +453,6 @@ def montar_row(original_cnpj_str: str, cnpj_limpo: str,
             "TIMESTAMP": ts
         }
 
-    # Caso de erro (sem api_data)
     msg = err_msg or "Falha desconhecida"
     return {
         "CNPJ_ORIGINAL": original_cnpj_str,
@@ -435,7 +461,7 @@ def montar_row(original_cnpj_str: str, cnpj_limpo: str,
         "UF": 'N/A',
         "Municipio": "N/A",
         "Endereco": "N/A",
-        "Regime Tributario": 'N/A',
+        "Regime Tributario": 'NORMAL',   # mesmo em erro mantemos um valor padrão
         "Regime": 'N/A',
         "Ano Regime Tributario": 'N/A',
         "Simples Nacional": 'N/A',
@@ -493,7 +519,6 @@ if st.button("🔱 Consultar em Lote", help="Inicia a consulta com limiter adapt
     if len(uniq_inputs) > MAX_INPUTS:
         st.error(f"Você enviou {len(uniq_inputs)} entradas. O limite deste app é {MAX_INPUTS}."); st.stop()
 
-    # Normaliza para CNPJ limpo e descarta entradas vazias
     normalized = [limpar_cnpj(x) for x in uniq_inputs if limpar_cnpj(x)]
     if not normalized:
         st.warning("Nenhuma entrada válida após normalização."); st.stop()
@@ -501,14 +526,13 @@ if st.button("🔱 Consultar em Lote", help="Inicia a consulta com limiter adapt
     job_id = mk_job_id(normalized)
     csv_autosave, xlsx_final = mk_paths(job_id)
 
-    # Garante header correto ANTES de qualquer escrita/leitura
+    # Garante header correto + MIGRA registros antigos
     ensure_autosave_header(csv_autosave, CSV_COLS)
 
-    done_set = load_done_set(csv_autosave)  # já normalizado
+    done_set = load_done_set(csv_autosave)
     to_do_orig: List[str] = []
     seen_clean: Set[str] = set()
 
-    # Mapeia o primeiro texto original para cada CNPJ limpo
     for original in uniq_inputs:
         c = limpar_cnpj(original)
         if not c or c in seen_clean:
@@ -518,15 +542,15 @@ if st.button("🔱 Consultar em Lote", help="Inicia a consulta com limiter adapt
             to_do_orig.append(original)
 
     st.info(
-        f"**Autosave** ativo em: `{csv_autosave}`  \n"
-        f"Já concluídos (histórico): **{len(done_set)}**  •  Pendentes nesta execução: **{len(to_do_orig)}**"
+        f"**Autosave**: `{csv_autosave}`  \n"
+        f"Concluídos (histórico): **{len(done_set)}**  •  Pendentes nesta execução: **{len(to_do_orig)}**"
     )
 
     all_rows_this_run: List[Dict[str, Any]] = []
 
     if to_do_orig:
         st.write("---")
-        st.write(f"Iniciando processamento de **{len(to_do_orig)}** CNPJs pendentes…")
+        st.write(f"Iniciando processamento de **{len(to_do_orig)}** CNPJs…")
         progress = st.progress(0)
         status_box = st.empty()
         limiter_global = AdaptiveLimiter(min_interval=START_INTERVAL)
@@ -550,15 +574,13 @@ if st.button("🔱 Consultar em Lote", help="Inicia a consulta com limiter adapt
                 all_rows_this_run.append(row)
                 processed_now += 1
 
-                # Autosave por bloco (layout sempre CSV_COLS)
                 if len(buffer_rows) >= AUTOSAVE_BLOCK:
                     written = append_rows_csv(csv_autosave, buffer_rows)
                     size_kb = os.path.getsize(csv_autosave) / 1024 if os.path.exists(csv_autosave) else 0
-                    st.caption(f"🔸 Autosave: gravadas **{written}** linhas (arquivo ~{size_kb:.1f} KB).")
+                    st.caption(f"🔸 Autosave: +{written} linhas (arquivo ~{size_kb:.1f} KB).")
                     _mark_done_from_rows(buffer_rows)
                     buffer_rows.clear()
 
-                # Status amigável
                 elapsed = time.time() - started_at
                 remaining_now = total_this_run - processed_now
                 eff_rate = processed_now / elapsed if elapsed > 0 else 0.0
@@ -566,19 +588,15 @@ if st.button("🔱 Consultar em Lote", help="Inicia a consulta com limiter adapt
                 finish_time = datetime.datetime.now(BRASILIA_TZ) + datetime.timedelta(seconds=int(eta_sec))
                 progress.progress(processed_now / max(total_this_run, 1))
                 status_box.info(
-                    f"📊 **Andamento:** {processed_now} de {total_this_run} CNPJs  \n"
-                    f"⚡ **Velocidade:** ~{eff_rate:.2f} CNPJs/seg  \n"
-                    f"⏳ **Tempo restante:** {humanize_seconds(eta_sec)}  \n"
-                    f"🕒 **Previsão de término:** {finish_time.strftime('%H:%M:%S')}"
+                    f"📊 {processed_now}/{total_this_run}  •  ⚡ {eff_rate:.2f} CNPJs/seg  •  ⏳ {humanize_seconds(eta_sec)}  •  🕒 {finish_time.strftime('%H:%M:%S')}"
                 )
 
-        # Flush final
         if buffer_rows:
             written = append_rows_csv(csv_autosave, buffer_rows)
             size_kb = os.path.getsize(csv_autosave) / 1024 if os.path.exists(csv_autosave) else 0
-            st.caption(f"🔸 Autosave (final): gravadas **{written}** linhas (arquivo ~{size_kb:.1f} KB).")
+            st.caption(f"🔸 Autosave (final): +{written} linhas (arquivo ~{size_kb:.1f} KB).")
 
-        st.success(f"Concluído! Total geral no autosave: **{len(done_set)}** CNPJs (normalizados).")
+        st.success(f"Concluído! Total no autosave (normalizados): **{len(done_set)}**.")
 
     # ===== Exibição/Download do consolidado =====
     st.markdown("---")
@@ -588,14 +606,17 @@ if st.button("🔱 Consultar em Lote", help="Inicia a consulta com limiter adapt
     if os.path.exists(csv_autosave):
         try:
             df_full = pd.read_csv(csv_autosave, sep=";", dtype=str, encoding="utf-8")
-            # Garante colunas na ordem certa mesmo se arquivo antigo tiver colunas extras
-            df_full = df_full.reindex(columns=CSV_COLS)
+            # saneia/migra também na leitura (dupla garantia)
+            df_full = migrate_old_columns(df_full)
         except Exception as e:
-            st.warning(f"Não consegui ler o autosave agora ({e}). Vou mostrar o que foi obtido nesta execução.")
+            st.warning(f"Não consegui ler o autosave agora ({e}). Mostrando somente o que rodou nesta execução.")
             df_full = pd.DataFrame(all_rows_this_run, columns=CSV_COLS)
 
     if df_full.empty and all_rows_this_run:
         df_full = pd.DataFrame(all_rows_this_run, columns=CSV_COLS)
+
+    # Por segurança, reaplica regra antes de exibir
+    df_full = apply_regime_rules(df_full)
 
     st.dataframe(df_full.fillna(""), use_container_width=True)
 
