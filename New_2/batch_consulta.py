@@ -78,12 +78,13 @@ MAX_INPUTS = 1000
 AUTOSAVE_BLOCK = 10
 OUTPUT_DIR = "autosave_cnpj"
 
-# Layout fixo do CSV (ordem imutável!)
+# ===== Layout fixo do CSV (ordem imutável pós-ajustes) =====
 CSV_COLS = [
-    "CNPJ_ORIGINAL","CNPJ_LIMPO","Razao Social","Nome Fantasia","UF",
-    "Simples Nacional","MEI","Regime Tributario","Ano Regime Tributario",
+    "CNPJ_ORIGINAL","CNPJ_LIMPO","Razao Social","UF",
+    "Municipio","Endereco","Regime Tributario","Ano Regime Tributario",
+    "Simples Nacional","MEI",
     "CNAE Principal","CNAE Secundario (primeiro)",
-    "Endereco","Municipio","Codigo IBGE Municipio","TIMESTAMP"
+    "Codigo IBGE Municipio","TIMESTAMP"
 ]
 
 # ---------- Cache global (thread-safe) ----------
@@ -217,7 +218,8 @@ def ensure_autosave_header(csv_path: str, expected_cols: List[str]) -> None:
         for col in expected_cols:
             if col not in df_old.columns:
                 df_old[col] = ""
-        df_old = df_old[expected_cols]
+        # remove colunas extras que não existem mais
+        df_old = df_old[[c for c in expected_cols]]
         df_old.to_csv(csv_path, sep=";", index=False, encoding="utf-8")
     except Exception:
         base, ext = os.path.splitext(csv_path)
@@ -391,16 +393,15 @@ def montar_row(original_cnpj_str: str, cnpj_limpo: str,
             "CNPJ_ORIGINAL": original_cnpj_str,
             "CNPJ_LIMPO": cnpj_limpo,
             "Razao Social": api_data.get('razao_social', 'N/A'),
-            "Nome Fantasia": api_data.get('nome_fantasia', 'N/A'),
             "UF": uf,
-            "Simples Nacional": "SIM" if api_data.get('opcao_pelo_simples') else ("NÃO" if api_data.get('opcao_pelo_simples') is False else "N/A"),
-            "MEI": "SIM" if api_data.get('opcao_pelo_mei') else ("NÃO" if api_data.get('opcao_pelo_mei') is False else "N/A"),
+            "Municipio": municipio,
+            "Endereco": endereco,
             "Regime Tributario": forma,
             "Ano Regime Tributario": ano,
+            "Simples Nacional": "SIM" if api_data.get('opcao_pelo_simples') else ("NÃO" if api_data.get('opcao_pelo_simples') is False else "N/A"),
+            "MEI": "SIM" if api_data.get('opcao_pelo_mei') else ("NÃO" if api_data.get('opcao_pelo_mei') is False else "N/A"),
             "CNAE Principal": cnae_pri,
             "CNAE Secundario (primeiro)": cnae_sec,
-            "Endereco": endereco,
-            "Municipio": municipio,
             "Codigo IBGE Municipio": str(ibge) if ibge else "N/A",
             "TIMESTAMP": ts
         }
@@ -410,16 +411,15 @@ def montar_row(original_cnpj_str: str, cnpj_limpo: str,
         "CNPJ_ORIGINAL": original_cnpj_str,
         "CNPJ_LIMPO": cnpj_limpo,
         "Razao Social": msg,
-        "Nome Fantasia": 'N/A',
         "UF": 'N/A',
-        "Simples Nacional": 'N/A',
-        "MEI": 'N/A',
+        "Municipio": "N/A",
+        "Endereco": "N/A",
         "Regime Tributario": 'N/A',
         "Ano Regime Tributario": 'N/A',
+        "Simples Nacional": 'N/A',
+        "MEI": 'N/A',
         "CNAE Principal": 'N/A',
         "CNAE Secundario (primeiro)": 'N/A',
-        "Endereco": "N/A",
-        "Municipio": "N/A",
         "Codigo IBGE Municipio": "N/A",
         "TIMESTAMP": ts
     }
@@ -566,6 +566,8 @@ if st.button("🔱 Consultar em Lote", help="Inicia a consulta com limiter adapt
     if os.path.exists(csv_autosave):
         try:
             df_full = pd.read_csv(csv_autosave, sep=";", dtype=str, encoding="utf-8")
+            # Garantir colunas na ordem certa mesmo se arquivo antigo tiver colunas extras
+            df_full = df_full.reindex(columns=CSV_COLS)
         except Exception as e:
             st.warning(f"Não consegui ler o autosave agora ({e}). Vou mostrar o que foi obtido nesta execução.")
             df_full = pd.DataFrame(all_rows_this_run, columns=CSV_COLS)
